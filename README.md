@@ -23,7 +23,7 @@
 ### 1) 准备 ADB
 
 1. 安装/配置 `adb`（Android SDK Platform-Tools），确保命令行可直接运行 `adb`。
-2. 连接模拟器/真机，并拿到序列号（例：MuMu 常见为 `127.0.0.1:xxxxx`）：
+2. 连接模拟器/真机，并拿到TCP/IP或emulator（例：常见为 `127.0.0.1:xxxxx`或 `emulator-xxxx`）：
 
 ```powershell
 adb devices
