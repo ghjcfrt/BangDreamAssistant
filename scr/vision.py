@@ -10,8 +10,7 @@ from typing import Dict, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
-
-from scr.img import IMG
+from img import IMG
 
 try:
     # rapidocr-onnxruntime
@@ -112,11 +111,11 @@ class TemplateMatcher:
         self._roi_rules: Dict[str, Tuple[float, float, float, float]] = {
             "menu": (1634, 16, 1907, 171),
             "skip1": (775, 34, 960, 146),
-            "skip2": (970, 614, 1345, 734),
+            "skip2": (950, 587, 1377, 750),
             "read": (1417, 910, 1796, 1033),
             "no_voice": (808, 814, 1105, 941),
             "lock": (326, 134, 414, 245),
-            "enter": (763, 722, 1154, 880),
+            "enter": (458, 91, 1459, 978),
         }
 
         # 上述 ROI 像素坐标基于 1920x1080；若实际截图分辨率不同，则按比例缩放。
@@ -140,6 +139,265 @@ class TemplateMatcher:
         env_on = (os.environ.get("BB_DEBUG_LOCK") or "").strip().lower() in {"1", "true", "yes", "on"}
         file_on = (self._debug_lock_dir / "enable").exists()
         self._debug_lock = bool(env_on or file_on)
+
+        # debug(per-target): 保存任意目标(例如 skip2/menu)的识别过程图，按 name 分目录输出。
+        # 推荐开启方式：创建 ./debug/<name>/enable（例如 ./debug/skip2/enable）。
+        # 也支持环境变量开关：BB_DEBUG_<NAME>=1（NAME 会被转成大写，非字母数字会变为下划线）。
+        # 兼容旧开关：
+        # - ./debug/vision/enable
+        # - BB_DEBUG_VISION=1
+        # 可选：
+        # - BB_DEBUG_VISION_NAMES=skip2,menu 仅输出指定 name（逗号分隔）
+        # - BB_DEBUG_VISION_FULL=1          同时保存整张截图（默认只保存 ROI）
+        # - BB_DEBUG_VISION_MIN_INTERVAL=1.0 同一 name 最小落盘间隔（秒）
+        self._debug_base_dir = base_debug_dir
+        self._debug_compat_vision_dir = base_debug_dir / "vision"
+        env_on_v = (os.environ.get("BB_DEBUG_VISION") or "").strip().lower() in {"1", "true", "yes", "on"}
+        file_on_v = (self._debug_compat_vision_dir / "enable").exists()
+        self._debug_vision = bool(env_on_v or file_on_v)
+        names_raw = (os.environ.get("BB_DEBUG_VISION_NAMES") or "").strip()
+        self._debug_vision_names = {n.strip() for n in names_raw.split(",") if n.strip()} if names_raw else set()
+        self._debug_vision_full = (os.environ.get("BB_DEBUG_VISION_FULL") or "").strip().lower() in {"1", "true", "yes", "on"}
+        try:
+            self._debug_vision_min_interval = float(os.environ.get("BB_DEBUG_VISION_MIN_INTERVAL") or 1.0)
+        except Exception:
+            self._debug_vision_min_interval = 1.0
+        self._debug_vision_last_dump: Dict[str, float] = {}
+
+    @staticmethod
+    def _env_flag_on(val: str) -> bool:
+        return (val or "").strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _debug_env_name_for(name: str) -> str:
+        safe = re.sub(r"[^0-9a-zA-Z]+", "_", str(name)).strip("_")
+        return f"BB_DEBUG_{safe.upper()}" if safe else "BB_DEBUG"
+
+    def _debug_target_dir(self, name: str) -> Path:
+        # lock 单独保持原目录（debug/lock）
+        if str(name) == "lock":
+            return self._debug_lock_dir
+        return self._debug_base_dir / str(name)
+
+    def _debug_vision_enabled_for(self, name: str) -> bool:
+        # 1) per-target enable 文件
+        target_dir = self._debug_target_dir(name)
+        if (target_dir / "enable").exists():
+            if not self._debug_vision_names:
+                return True
+            return str(name) in self._debug_vision_names
+
+        # 2) per-target 环境变量开关
+        env_key = self._debug_env_name_for(name)
+        if self._env_flag_on(os.environ.get(env_key) or ""):
+            if not self._debug_vision_names:
+                return True
+            return str(name) in self._debug_vision_names
+
+        # 3) 兼容全局开关（旧：debug/vision/enable 或 BB_DEBUG_VISION=1）
+        if self._debug_vision:
+            if not self._debug_vision_names:
+                return True
+            return str(name) in self._debug_vision_names
+
+        return False
+
+    def debug_dump_if_enabled(
+        self,
+        screen_bgr: np.ndarray,
+        name: str,
+        *,
+        reason: str = "",
+        mode: str = "template",
+    ) -> None:
+        """当开启 BB_DEBUG_VISION 时，将识别过程图落盘。
+
+        设计目标：用于排查 wait_img 失败(best=N/A) 的原因（ROI 错、模板未加载、尺寸不匹配等）。
+        """
+
+        if not self._debug_vision_enabled_for(name):
+            return
+        now = time.time()
+        last = float(self._debug_vision_last_dump.get(str(name), 0.0))
+        if self._debug_vision_min_interval > 0 and (now - last) < self._debug_vision_min_interval:
+            return
+        self._debug_vision_last_dump[str(name)] = now
+
+        sh, sw = screen_bgr.shape[:2]
+        x0, y0, x1, y1 = self._roi_for(name, sw, sh)
+        roi = screen_bgr[y0:y1, x0:x1]
+
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        uniq = str(time.time_ns())[-6:]
+        out_base = self._debug_target_dir(name)
+        out_dir = out_base / f"{stamp}_{uniq}_sw{sw}_sh{sh}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        meta_lines = [
+            f"name={name}",
+            f"mode={mode}",
+            f"reason={reason}",
+            f"screen={sw}x{sh}",
+            f"roi=({x0},{y0})-({x1},{y1}) size={max(0, x1-x0)}x{max(0, y1-y0)}",
+        ]
+
+        if self._debug_vision_full:
+            self._imwrite(out_dir / "screen_bgr.png", screen_bgr)
+
+        if roi.size == 0:
+            (out_dir / "meta.txt").write_text("\n".join(meta_lines + ["roi_empty=1"]), encoding="utf-8")
+            return
+
+        # ROI 与预处理
+        roi_gray_raw = _to_gray(roi)
+        roi_gray_eq = _prep_gray_match(roi_gray_raw)
+        roi_edge = _prep_edge(roi_gray_raw)
+        roi_edge_soft = _prep_edge_soft(roi_gray_raw)
+        self._imwrite(out_dir / "roi_bgr.png", roi)
+        self._imwrite(out_dir / "roi_gray_raw.png", roi_gray_raw)
+        self._imwrite(out_dir / "roi_gray_eq.png", roi_gray_eq)
+        self._imwrite(out_dir / "roi_edge.png", roi_edge)
+        self._imwrite(out_dir / "roi_edge_soft.png", roi_edge_soft)
+
+        # 模板与匹配（仅用于调试观察；不改变主逻辑）
+        if name not in self._templates_gray:
+            (out_dir / "meta.txt").write_text("\n".join(meta_lines + ["template_loaded=0"]), encoding="utf-8")
+            return
+
+        base_w, base_h = self._sizes[name]
+        scales = self._multi_scales.get(name, (1.0,))
+        meta_lines.append(f"tpl_base={base_w}x{base_h}")
+        meta_lines.append(f"scales={','.join(str(float(s)) for s in scales)}")
+
+        best_method = ""
+        best_score: Optional[float] = None
+        best_loc: Optional[Tuple[int, int]] = None
+        best_size: Optional[Tuple[int, int]] = None
+        best_res: Optional[np.ndarray] = None
+        best_tpl: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None
+
+        # 记录每种方法的 best，方便定位“为什么某一种方法一直是 N/A/很低”。
+        best_gray = -1.0
+        best_edge = -1.0
+        best_edge_soft = -1.0
+
+        for s in scales:
+            w = int(round(base_w * float(s)))
+            h = int(round(base_h * float(s)))
+            if w < 6 or h < 6:
+                continue
+            if h > roi_gray_eq.shape[0] or w > roi_gray_eq.shape[1]:
+                continue
+
+            tpl_gray, tpl_edge, tpl_edge_soft = self._get_scaled_tpl(name, w, h)
+
+            # 1) 灰度（CCOEFF_NORMED 映射到 [0,1]）
+            res_g = cv2.matchTemplate(roi_gray_eq, tpl_gray, cv2.TM_CCOEFF_NORMED)
+            _, max_val_g_raw, _, max_loc_g = cv2.minMaxLoc(res_g)
+            max_val_g = (float(max_val_g_raw) + 1.0) * 0.5
+            if max_val_g > best_gray:
+                best_gray = float(max_val_g)
+            if best_score is None or float(max_val_g) > best_score:
+                best_score = float(max_val_g)
+                best_method = "gray_ccoeff"
+                best_loc = (int(max_loc_g[0]), int(max_loc_g[1]))
+                best_size = (w, h)
+                best_res = res_g
+                best_tpl = (tpl_gray, tpl_edge, tpl_edge_soft)
+
+            # 2) 边缘（正常）
+            res_e = cv2.matchTemplate(roi_edge, tpl_edge, cv2.TM_CCORR_NORMED)
+            _, max_val_e, _, max_loc_e = cv2.minMaxLoc(res_e)
+            if float(max_val_e) > best_edge:
+                best_edge = float(max_val_e)
+            if best_score is None or float(max_val_e) > best_score:
+                best_score = float(max_val_e)
+                best_method = "edge_ccorr"
+                best_loc = (int(max_loc_e[0]), int(max_loc_e[1]))
+                best_size = (w, h)
+                best_res = res_e
+                best_tpl = (tpl_gray, tpl_edge, tpl_edge_soft)
+
+            # 3) 边缘（软）
+            res_e2 = cv2.matchTemplate(roi_edge_soft, tpl_edge_soft, cv2.TM_CCORR_NORMED)
+            _, max_val_e2, _, max_loc_e2 = cv2.minMaxLoc(res_e2)
+            if float(max_val_e2) > best_edge_soft:
+                best_edge_soft = float(max_val_e2)
+            if best_score is None or float(max_val_e2) > best_score:
+                best_score = float(max_val_e2)
+                best_method = "edge_soft_ccorr"
+                best_loc = (int(max_loc_e2[0]), int(max_loc_e2[1]))
+                best_size = (w, h)
+                best_res = res_e2
+                best_tpl = (tpl_gray, tpl_edge, tpl_edge_soft)
+
+        meta_lines.append(f"best_gray={best_gray:.4f}")
+        meta_lines.append(f"best_edge={best_edge:.4f}")
+        meta_lines.append(f"best_edge_soft={best_edge_soft:.4f}")
+
+        if best_score is None or best_loc is None or best_size is None or best_tpl is None:
+            (out_dir / "meta.txt").write_text("\n".join(meta_lines + ["matchable=0"]), encoding="utf-8")
+            return
+
+        meta_lines.append(f"best_method={best_method}")
+        meta_lines.append(f"best_score={float(best_score):.4f}")
+        meta_lines.append(f"best_loc=({best_loc[0]},{best_loc[1]})")
+        meta_lines.append(f"best_size={best_size[0]}x{best_size[1]}")
+        (out_dir / "meta.txt").write_text("\n".join(meta_lines), encoding="utf-8")
+
+        tpl_gray, tpl_edge, tpl_edge_soft = best_tpl
+        self._imwrite(out_dir / "tpl_gray.png", tpl_gray)
+        self._imwrite(out_dir / "tpl_edge.png", tpl_edge)
+        self._imwrite(out_dir / "tpl_edge_soft.png", tpl_edge_soft)
+
+        bx, by = best_loc
+        bw, bh = best_size
+        roi_h, roi_w = roi.shape[:2]
+
+        # 在 ROI 上画出 best 匹配框（更像 lock 的“过程可视化”）
+        roi_box = roi.copy()
+        try:
+            cv2.rectangle(roi_box, (int(bx), int(by)), (int(bx + bw), int(by + bh)), (0, 255, 0), 2)
+        except Exception:
+            pass
+        self._imwrite(out_dir / "roi_bgr_box.png", roi_box)
+
+        # lock 风格：同时保存 semantic patch 与 padded patch，并输出 patch 的预处理结果
+        sx0 = int(max(0, min(roi_w, bx)))
+        sy0 = int(max(0, min(roi_h, by)))
+        sx1 = int(max(0, min(roi_w, bx + bw)))
+        sy1 = int(max(0, min(roi_h, by + bh)))
+
+        patch_sem = roi[sy0:sy1, sx0:sx1]
+        if patch_sem.size:
+            self._imwrite(out_dir / "best_patch_semantic_bgr.png", patch_sem)
+
+        pad = int(max(2, round(min(bw, bh) * 0.12)))
+        px0 = int(max(0, sx0 - pad))
+        py0 = int(max(0, sy0 - pad))
+        px1 = int(min(roi_w, sx1 + pad))
+        py1 = int(min(roi_h, sy1 + pad))
+        patch_bgr = roi[py0:py1, px0:px1]
+        if patch_bgr.size:
+            self._imwrite(out_dir / "best_patch_bgr.png", patch_bgr)
+            patch_gray_raw = _to_gray(patch_bgr)
+            patch_gray_eq = _prep_gray_match(patch_gray_raw)
+            patch_edge = _prep_edge(patch_gray_raw)
+            patch_edge_soft = _prep_edge_soft(patch_gray_raw)
+            self._imwrite(out_dir / "best_patch_gray_raw.png", patch_gray_raw)
+            self._imwrite(out_dir / "best_patch_gray_eq.png", patch_gray_eq)
+            self._imwrite(out_dir / "best_patch_edge.png", patch_edge)
+            self._imwrite(out_dir / "best_patch_edge_soft.png", patch_edge_soft)
+
+        if best_res is not None and isinstance(best_res, np.ndarray) and best_res.size:
+            r = best_res.astype(np.float32)
+            r = r - float(np.min(r))
+            mx = float(np.max(r))
+            if mx > 1e-8:
+                r = r / mx
+            r8 = np.clip(r * 255.0, 0, 255).astype(np.uint8)
+            heat = cv2.applyColorMap(r8, cv2.COLORMAP_JET)
+            self._imwrite(out_dir / "response_heat.png", heat)
 
     @staticmethod
     def _imwrite(path: Path, img: np.ndarray) -> None:
@@ -256,9 +514,12 @@ class TemplateMatcher:
         rel = Path(filename)
         # 兼容两种写法：
         # - "enter.png"：相对于 img_dir
-        # - "img/enter.png"：相对于项目根目录（img_dir 的父目录）
+        # - "assets/images/enter.png"：相对于项目根目录（img_dir 的父目录的父目录）
+        # - "images/enter.png"：相对于 assets 目录（img_dir 的父目录）
         if rel.is_absolute():
             path = rel
+        elif len(rel.parts) >= 2 and rel.parts[0] == "assets" and rel.parts[1] == "images":
+            path = self.img_dir.parent.parent / rel
         elif rel.parts and rel.parts[0] == self.img_dir.name:
             path = self.img_dir.parent / rel
         else:
@@ -565,11 +826,27 @@ class TemplateMatcher:
         self.load("lock", IMG.LOCK)
         self.load("enter", IMG.ENTER)
 
-    def find_best(self, screen_bgr: np.ndarray, name: str, *, allow_ocr: bool = True) -> Optional[Match]:
-        # 规则（强制路由）：
-        # - menu/skip1/skip2/no_voice/read：只走 OCR（失败即视为未命中，不回退模板匹配）
-        # - lock：只走图像识别（模板匹配），并优先灰度匹配（永不走 OCR）
+    def find_template_only(self, screen_bgr: np.ndarray, name: str) -> Optional[Match]:
+        """仅使用模板匹配（不走 OCR）。
 
+        说明：lock 本身也只走模板匹配；该方法对所有 name 行为一致。
+        """
+
+        return self.find_best(screen_bgr, name, allow_ocr=False)
+
+    def find_ocr_only(self, screen_bgr: np.ndarray, name: str) -> Optional[Match]:
+        """仅使用 OCR（不做模板匹配回退）。
+
+        如果 OCR 引擎不可用/未配置 pattern，则返回 None。
+        """
+
+        # lock 是图标（无文字），OCR 不适用。
+        if name == "lock":
+            return None
+
+        return self._find_by_ocr(screen_bgr, name)
+
+    def find_best(self, screen_bgr: np.ndarray, name: str, *, allow_ocr: bool = True) -> Optional[Match]:
         # lock：明确使用图像识别（模板匹配），并优先考虑灰度图。
         # 这里采用“多种匹配方法 + 形状校验（圆形）”，解决 lock 置信度偏低的问题。
         # 同时支持落盘调试：
@@ -775,12 +1052,6 @@ class TemplateMatcher:
                 size=best_size,
             )
 
-        # OCR-only：这些按钮只用 OCR 判断；不命中就返回 None。
-        if name in {"menu", "skip1", "skip2", "no_voice", "read"}:
-            if not allow_ocr:
-                return None
-            return self._find_by_ocr(screen_bgr, name)
-
         # 其他目标：OCR（可选）→ 模板匹配回退
         # 性能敏感场景（例如实时循环）可通过 allow_ocr=False 强制走模板匹配。
         if allow_ocr and name in self._ocr_enabled_for:
@@ -794,6 +1065,10 @@ class TemplateMatcher:
         sh, sw = screen_bgr.shape[:2]
         x0, y0, x1, y1 = self._roi_for(name, sw, sh)
         roi = screen_bgr[y0:y1, x0:x1]
+
+        if roi.size == 0:
+            self.debug_dump_if_enabled(screen_bgr, name, reason="empty_roi", mode="template")
+            return None
 
         roi_gray_raw = _to_gray(roi)
         screen_gray = _prep_gray_match(roi_gray_raw)
@@ -847,6 +1122,7 @@ class TemplateMatcher:
 
         # 若 ROI/模板尺寸导致无法匹配（没有任何 scale 可用），返回 None
         if best_score is None or best_loc is None or best_size is None:
+            self.debug_dump_if_enabled(screen_bgr, name, reason="no_scale_match", mode="template")
             return None
 
         # 坐标从 ROI 转回全屏

@@ -5,7 +5,6 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-
 from vision import TemplateMatcher
 
 
@@ -31,7 +30,7 @@ def main() -> None:
     screen_bgr = _read_image(img_path)
 
     base_dir = Path(__file__).resolve().parent.parent
-    img_dir = base_dir / "img"
+    img_dir = base_dir / "assets/images"
 
     matcher = TemplateMatcher(img_dir)
     engine = matcher._ensure_ocr()

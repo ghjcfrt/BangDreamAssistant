@@ -6,7 +6,7 @@
 
 
 class IMG:
-	BASE = "img"
+	BASE = "assets/images"
 
 	MENU = f"{BASE}/menu.png"
 	SKIP1 = f"{BASE}/skip1.png"

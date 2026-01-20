@@ -10,9 +10,8 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from PySide6 import QtCore, QtGui, QtWidgets
-
 from adb_client import AdbClient
+from PySide6 import QtCore, QtGui, QtWidgets
 from vision import TemplateMatcher
 from workers import RealtimeWorker, SharedContext, TaskWorker, Thresholds
 
@@ -41,11 +40,14 @@ class AppWindow(QtWidgets.QMainWindow):
             pass
 
         base_dir = Path(__file__).resolve().parent.parent
-        img_dir = base_dir / "img"
+        img_dir = base_dir / "assets/images"
 
         self.adb = AdbClient(adb_path="adb")
         self.matcher = TemplateMatcher(img_dir)
         self.matcher.load_defaults()
+
+        # 识别模式：template（默认） / ocr
+        os.environ.setdefault("BB_VISION_MODE", "template")
 
         self._build_ui()
 
@@ -54,6 +56,7 @@ class AppWindow(QtWidgets.QMainWindow):
             serial_getter=self._get_serial,
             matcher=self.matcher,
             thresholds_getter=self._get_thresholds,
+            recognition_mode_getter=self._get_recognition_mode,
             log_queue=self.log_queue,
         )
 
@@ -62,6 +65,8 @@ class AppWindow(QtWidgets.QMainWindow):
 
         self._shot_thread: Optional["_ScreenshotThread"] = None
         self._shot_dialog: Optional["_ScreenshotPreviewDialog"] = None
+
+        self._menu_test_thread: Optional["_MenuTestThread"] = None
 
         self._log_timer = QtCore.QTimer(self)
         self._log_timer.setInterval(120)
@@ -207,6 +212,25 @@ class AppWindow(QtWidgets.QMainWindow):
         v_debug = QtWidgets.QVBoxLayout(gb_debug)
         v_debug.setSpacing(8)
 
+        # 识别方式：模板 / OCR
+        mode_row = QtWidgets.QHBoxLayout()
+        mode_row.addWidget(QtWidgets.QLabel("识别方式："))
+        self.vision_mode_combo = QtWidgets.QComboBox()
+        self.vision_mode_combo.addItems(["模板识别（默认）", "OCR"])
+        self.vision_mode_combo.setToolTip(
+            "选择识别方式：\n"
+            "- 模板识别：默认；置信度通常更高，阈值建议 0.90\n"
+            "- OCR：识别文字按钮；速度更慢，阈值通常要更低（可自行调参）"
+        )
+        self.vision_mode_combo.currentIndexChanged.connect(self.on_change_vision_mode)
+        mode_row.addWidget(self.vision_mode_combo, 1)
+        v_debug.addLayout(mode_row)
+
+        self.vision_mode_hint = QtWidgets.QLabel("")
+        self.vision_mode_hint.setStyleSheet("color: #666;")
+        self.vision_mode_hint.setWordWrap(True)
+        v_debug.addWidget(self.vision_mode_hint)
+
         # OCR 加速选择（CPU / DirectML / CUDA）
         accel_row = QtWidgets.QHBoxLayout()
         accel_row.addWidget(QtWidgets.QLabel("OCR 加速："))
@@ -236,6 +260,15 @@ class AppWindow(QtWidgets.QMainWindow):
         self.screenshot_hint.setWordWrap(True)
         v_debug.addWidget(self.screenshot_hint)
 
+        self.menu_test_btn = QtWidgets.QPushButton("menu 单独测试")
+        self.menu_test_btn.clicked.connect(self.on_menu_test)
+        v_debug.addWidget(self.menu_test_btn)
+
+        self.menu_test_hint = QtWidgets.QLabel("抓取当前截图，分别用“模板 / OCR”测试 menu 并输出分数")
+        self.menu_test_hint.setStyleSheet("color: #666;")
+        self.menu_test_hint.setWordWrap(True)
+        v_debug.addWidget(self.menu_test_hint)
+
         gb_tip = QtWidgets.QGroupBox("提示")
         right.addWidget(gb_tip)
         v_tip = QtWidgets.QVBoxLayout(gb_tip)
@@ -252,6 +285,32 @@ class AppWindow(QtWidgets.QMainWindow):
 
         # UI 初始化结束后同步一次 OCR 加速状态
         self._sync_ocr_accel_ui()
+
+        # 同步一次识别模式 UI
+        self._sync_vision_mode_ui()
+
+    def _get_recognition_mode(self) -> str:
+        raw = (os.environ.get("BB_VISION_MODE") or "template").strip().lower()
+        if raw in {"template", "ocr"}:
+            return raw
+        return "template"
+
+    def _sync_vision_mode_ui(self) -> None:
+        mode = self._get_recognition_mode()
+        idx = 0 if mode == "template" else 1
+        self.vision_mode_combo.blockSignals(True)
+        self.vision_mode_combo.setCurrentIndex(idx)
+        self.vision_mode_combo.blockSignals(False)
+        self.vision_mode_hint.setText(f"当前识别方式：{mode.upper()}（模板默认阈值建议 0.90；menu 建议单独测试）")
+
+    def on_change_vision_mode(self) -> None:
+        text = (self.vision_mode_combo.currentText() or "").strip().lower()
+        mode = "template"
+        if "ocr" in text:
+            mode = "ocr"
+        os.environ["BB_VISION_MODE"] = mode
+        self.log(f"识别方式已切换为：{mode}")
+        self._sync_vision_mode_ui()
 
     def _sync_ocr_accel_ui(self) -> None:
         raw = (os.environ.get("BB_OCR_ACCEL") or "dml").strip().lower()
@@ -309,14 +368,12 @@ class AppWindow(QtWidgets.QMainWindow):
     def _get_thresholds(self) -> Thresholds:
         return Thresholds(
             values={
-                # 置信度已统一为 0~1（详见 vision.py），默认阈值相应上调。
-                # menu/skip* 默认走 OCR：置信度通常比模板匹配略低，阈值相应下调
-                "menu": self._parse_threshold(self.th_menu.text(), 0.60),
-                "skip1": self._parse_threshold(self.th_skip1.text(), 0.60),
-                "skip2": self._parse_threshold(self.th_skip2.text(), 0.60),
-                "read": self._parse_threshold(self.th_read.text(), 0.60),
-                "no_voice": self._parse_threshold(self.th_no_voice.text(), 0.60),
-                # lock 明确走灰度模板匹配（灰度优先），分数通常比边缘匹配更保守
+                # 默认：模板识别为主，阈值统一按 0.90；menu 例外（需要单独测试后再调）
+                "menu": self._parse_threshold(self.th_menu.text(), 0.80),
+                "skip1": self._parse_threshold(self.th_skip1.text(), 0.90),
+                "skip2": self._parse_threshold(self.th_skip2.text(), 0.90),
+                "read": self._parse_threshold(self.th_read.text(), 0.90),
+                "no_voice": self._parse_threshold(self.th_no_voice.text(), 0.90),
                 "lock": self._parse_threshold(self.th_lock.text(), 0.90),
             }
         )
@@ -379,13 +436,75 @@ class AppWindow(QtWidgets.QMainWindow):
             self.log(f"刷新设备失败：{e}")
 
     def reset_thresholds(self) -> None:
-        self.th_menu.setText("0.60")
-        self.th_skip1.setText("0.60")
-        self.th_skip2.setText("0.60")
-        self.th_read.setText("0.60")
-        self.th_no_voice.setText("0.60")
+        self.th_menu.setText("0.80")
+        self.th_skip1.setText("0.90")
+        self.th_skip2.setText("0.90")
+        self.th_read.setText("0.90")
+        self.th_no_voice.setText("0.90")
         self.th_lock.setText("0.90")
         self.log("阈值已恢复默认")
+
+    @QtCore.Slot()
+    def on_menu_test(self) -> None:
+        try:
+            _ = self._get_serial()
+        except Exception as e:
+            self.log(f"menu 测试失败：{e}")
+            return
+
+        t0 = self._menu_test_thread
+        if t0 is not None:
+            try:
+                if t0.isRunning():
+                    self.log("menu 测试：正在进行中")
+                    return
+            except RuntimeError:
+                self._menu_test_thread = None
+
+        self.menu_test_btn.setEnabled(False)
+        self.log("menu 测试：开始")
+
+        t = _MenuTestThread(self.ctx, parent=self)
+        t.success.connect(self._on_menu_test_ready)
+        t.failure.connect(lambda msg: self.log(f"menu 测试失败：{msg}"))
+        t.finished.connect(self._on_menu_test_thread_finished)
+        t.finished.connect(t.deleteLater)
+        self._menu_test_thread = t
+        t.start()
+
+    @QtCore.Slot()
+    def _on_menu_test_thread_finished(self) -> None:
+        self.menu_test_btn.setEnabled(True)
+        try:
+            sender = self.sender()
+        except Exception:
+            sender = None
+        if sender is None or getattr(self, "_menu_test_thread", None) is sender:
+            self._menu_test_thread = None
+
+    @QtCore.Slot(object)
+    def _on_menu_test_ready(self, payload: dict) -> None:
+        screen_bgr = payload.get("screen")
+        if isinstance(screen_bgr, np.ndarray):
+            self._on_screenshot_ready(screen_bgr)
+
+        tpl = payload.get("tpl")
+        ocr = payload.get("ocr")
+        th = float(payload.get("threshold", 0.80))
+
+        def fmt(m):
+            if m is None:
+                return "N/A"
+            x, y = m.center
+            return f"score={m.score:.3f} at=({x},{y})"
+
+        self.log(f"menu 阈值 th={th:.3f}")
+        self.log(f"menu 模板：{fmt(tpl)}")
+        self.log(f"menu OCR：{fmt(ocr)}")
+        if tpl is not None and tpl.score >= th:
+            self.log("menu 模板：达标")
+        if ocr is not None and ocr.score >= th:
+            self.log("menu OCR：达标")
 
     def _ensure_screenshot_dialog(self) -> "_ScreenshotPreviewDialog":
         if self._shot_dialog is None:
@@ -531,6 +650,25 @@ class _ScreenshotThread(QtCore.QThread):
             self.failure.emit(str(e))
 
 
+class _MenuTestThread(QtCore.QThread):
+    success = QtCore.Signal(object)
+    failure = QtCore.Signal(str)
+
+    def __init__(self, ctx: SharedContext, parent: Optional[QtCore.QObject] = None) -> None:
+        super().__init__(parent)
+        self._ctx = ctx
+
+    def run(self) -> None:
+        try:
+            img = self._ctx.screenshot()
+            th = self._ctx.thresholds_getter().get("menu", 0.80)
+            tpl = self._ctx.find_template_only(img, "menu")
+            ocr = self._ctx.find_ocr_only(img, "menu")
+            self.success.emit({"screen": img, "tpl": tpl, "ocr": ocr, "threshold": th})
+        except Exception as e:
+            self.failure.emit(str(e))
+
+
 class _ScreenshotPreviewDialog(QtWidgets.QDialog):
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
@@ -643,4 +781,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    main()
+    main()
     main()

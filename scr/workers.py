@@ -27,12 +27,14 @@ class SharedContext:
         serial_getter: Callable[[], str],
         matcher: TemplateMatcher,
         thresholds_getter: Callable[[], Thresholds],
+        recognition_mode_getter: Callable[[], str],
         log_queue: "queue.Queue[str]",
     ) -> None:
         self.adb = adb
         self.serial_getter = serial_getter
         self.matcher = matcher
         self.thresholds_getter = thresholds_getter
+        self.recognition_mode_getter = recognition_mode_getter
         self.log_queue = log_queue
         self.adb_lock = threading.Lock()
         # 重要：TemplateMatcher 内部包含 OCR 引擎与缓存，且底层依赖 OpenCV/onnxruntime。
@@ -73,13 +75,27 @@ class SharedContext:
         with self.adb_lock:
             self.adb.tap(serial, x, y)
 
+    def recognition_mode(self) -> str:
+        raw = (self.recognition_mode_getter() or "template").strip().lower()
+        return raw if raw in {"template", "ocr"} else "template"
+
     def find(self, screen_bgr, name: str):
         with self.vision_lock:
-            return self.matcher.find_best(screen_bgr, name)
+            mode = self.recognition_mode()
+            allow_ocr = (mode == "ocr")
+            return self.matcher.find_best(screen_bgr, name, allow_ocr=allow_ocr)
 
     def find2(self, screen_bgr, name: str, *, allow_ocr: bool = True):
         with self.vision_lock:
             return self.matcher.find_best(screen_bgr, name, allow_ocr=allow_ocr)
+
+    def find_template_only(self, screen_bgr, name: str):
+        with self.vision_lock:
+            return self.matcher.find_template_only(screen_bgr, name)
+
+    def find_ocr_only(self, screen_bgr, name: str):
+        with self.vision_lock:
+            return self.matcher.find_ocr_only(screen_bgr, name)
 
 
 class RealtimeWorker:
@@ -92,6 +108,10 @@ class RealtimeWorker:
         self._last_best_log: Dict[str, float] = {}
         # 上一次实际点击到的按钮：用于下一轮调整优先级（menu -> skip1 -> skip2 -> menu）
         self._last_clicked: Optional[str] = None
+        self._last_click_ts: Dict[str, float] = {}
+        # menu 按钮在多数界面里“常驻”，如果 skip1/skip2 未识别到会导致反复点 menu。
+        # 加一个轻量冷却，避免短时间内连续重复点击。
+        self._click_cooldown_s: Dict[str, float] = {"menu": 1.2}
         # 限制实时识别频率：减少截图 + OCR 负载
         self._min_cycle_s: float = 0.25
         # OCR 作为保底：每个按钮最多 1s 触发一次 OCR
@@ -145,6 +165,7 @@ class RealtimeWorker:
 
                 screen = self.ctx.screenshot()
                 thresholds = self.ctx.thresholds_getter()
+                mode = self.ctx.recognition_mode()
 
                 for name in self._priority_names():
                     if self._terminate.is_set() or (not self._enabled.is_set()):
@@ -156,30 +177,37 @@ class RealtimeWorker:
                         self._last_best_log[name] = now
 
                     th = thresholds.get(name, 0.90)
-                    # 每轮先用模板匹配（快）
-                    m_tpl = self.ctx.find2(screen, name, allow_ocr=False)
-                    if m_tpl is not None and m_tpl.score >= th:
-                        self.operator.click_box(m_tpl, after_sleep=0.1)
-                        self._last_clicked = name
-                        break
 
-                    # OCR 保底（很重）：降频触发
-                    m = m_tpl
-                    ocr_last = float(self._last_ocr_try.get(name, 0.0))
-                    if (now - ocr_last) >= self._ocr_min_interval_s:
-                        self._last_ocr_try[name] = now
-                        m_ocr = self.ctx.find2(screen, name, allow_ocr=True)
-                        if m_ocr is not None and m_ocr.score >= th:
-                            self.operator.click_box(m_ocr, after_sleep=0.1)
-                            self._last_clicked = name
-                            break
-                        if m_ocr is not None:
-                            m = m_ocr
+                    # 点击冷却：避免同一个按钮在短时间内被反复点（尤其是 menu 常驻场景）
+                    cd = float(self._click_cooldown_s.get(name, 0.0))
+                    if cd > 0:
+                        last_click = float(self._last_click_ts.get(name, 0.0))
+                        if (now - last_click) < cd:
+                            continue
+
+                    m = None
+                    if mode == "template":
+                        # 模板识别：每轮都跑（轻）
+                        m = self.ctx.find_template_only(screen, name)
+                    else:
+                        # OCR 识别：很重，降频触发（每个按钮最多 1s 一次）
+                        ocr_last = float(self._last_ocr_try.get(name, 0.0))
+                        if (now - ocr_last) >= self._ocr_min_interval_s:
+                            self._last_ocr_try[name] = now
+                            m = self.ctx.find_ocr_only(screen, name)
+
+                    if m is not None and m.score >= th:
+                        self.operator.click_box(m, after_sleep=0.1)
+                        self._last_clicked = name
+                        self._last_click_ts[name] = time.time()
+                        break
 
                     # 失败也输出最高置信度(best)的日志（限流到每秒最多一次）
                     if log_best:
                         if m is None:
                             self.ctx.log(f"wait_img 失败：{name} best=N/A th={th:.3f} timeout=0.0s")
+                            # 输出 ROI/过程图，便于排查为什么一直 N/A
+                            self.ctx.matcher.debug_dump_if_enabled(screen, name, reason="best_na", mode=mode)
                         else:
                             x, y = m.center
                             self.ctx.log(
