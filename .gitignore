@@ -1,0 +1,18 @@
+failures_ids.txt
+scr/__pycache__
+.history/
+.vscode/
+output/
+build/
+dist/
+*.log
+
+# Environments
+.env
+.envrc
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/

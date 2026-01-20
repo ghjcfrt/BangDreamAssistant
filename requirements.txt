@@ -1,0 +1,4 @@
+opencv-python>=4.9
+numpy>=1.26
+PySide6>=6.6
+rapidocr-onnxruntime>=1.3

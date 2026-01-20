@@ -1,0 +1,7 @@
+# 可选 GPU/加速依赖
+#
+# Windows 上推荐优先使用 DirectML（兼容 AMD/Intel/NVIDIA，免装 CUDA/cuDNN）：
+onnxruntime-directml>=1.17
+
+# 如果你明确要用 NVIDIA CUDA（通常更快），请改为安装 onnxruntime-gpu，并确保系统已安装 CUDA 12.x + cuDNN 9.x：
+# onnxruntime-gpu>=1.17
