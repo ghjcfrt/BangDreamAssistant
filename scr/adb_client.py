@@ -50,20 +50,22 @@ class AdbClient:
         cp = self._run_text(["connect", address], timeout_s=10.0)
         return (cp.stdout or "").strip() or (cp.stderr or "").strip()
 
-    def screencap_png(self, serial: str) -> bytes:
-        cp = self._run(["-s", serial, "exec-out", "screencap", "-p"], timeout_s=10.0)
+    def screencap_png(self, serial: str, timeout_s: float = 10.0) -> bytes:
+        cp = self._run(
+            ["-s", serial, "exec-out", "screencap", "-p"], timeout_s=timeout_s
+        )
         if cp.returncode != 0:
             raise RuntimeError((cp.stderr or b"").decode("utf-8", errors="ignore") or "adb screencap failed")
         return cp.stdout
 
-    def screencap_raw(self, serial: str) -> bytes:
+    def screencap_raw(self, serial: str, timeout_s: float = 2.0) -> bytes:
         """Capture raw framebuffer bytes.
 
         Compared to PNG (`screencap -p`), raw output avoids PNG decode CPU cost.
         Not all devices/emulators support/behave consistently; caller should fall back to PNG.
         """
 
-        cp = self._run(["-s", serial, "exec-out", "screencap"], timeout_s=10.0)
+        cp = self._run(["-s", serial, "exec-out", "screencap"], timeout_s=timeout_s)
         if cp.returncode != 0:
             raise RuntimeError((cp.stderr or b"").decode("utf-8", errors="ignore") or "adb screencap(raw) failed")
         return cp.stdout

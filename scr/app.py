@@ -7,7 +7,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TextIO
 
 import numpy as np
 from adb_client import AdbClient
@@ -30,17 +30,22 @@ class AppWindow(QtWidgets.QMainWindow):
         self.resize(980, 560)
 
         self.log_queue: "queue.Queue[str]" = queue.Queue()
+        self._base_dir = Path(__file__).resolve().parent.parent
+        self._log_path: Optional[Path] = None
+        self._log_fp: Optional[TextIO] = None
+        self._init_log_file()
 
         # 启动自检：便于定位是否误用到 uv 的 Python 3.13.0 等解释器
         try:
+            if self._log_path is not None:
+                self.log(f"日志文件：{self._log_path}")
             self.log(f"Python: {sys.version.splitlines()[0]} | exe: {sys.executable}")
             if sys.version_info[:3] == (3, 13, 0):
                 self.log("提示：检测到 Python 3.13.0；若退出时报 threading shutdown SystemError，建议升级到 3.13.1+ 或使用 3.12")
         except Exception:
             pass
 
-        base_dir = Path(__file__).resolve().parent.parent
-        img_dir = base_dir / "assets/images"
+        img_dir = self._base_dir / "assets/images"
 
         self.adb = AdbClient(adb_path="adb")
         self.matcher = TemplateMatcher(img_dir)
@@ -187,9 +192,14 @@ class AppWindow(QtWidgets.QMainWindow):
             grid.addWidget(e2, row, 3)
             return e1, e2
 
-        self.th_menu, self.th_read = th_row(0, "menu", "read")
-        self.th_skip1, self.th_no_voice = th_row(1, "skip1", "no_voice")
-        self.th_skip2, self.th_lock = th_row(2, "skip2", "lock")
+        self.th_skip1, self.th_no_voice = th_row(0, "skip1", "no_voice")
+        self.th_skip2, self.th_lock = th_row(1, "skip2", "lock")
+
+        enter_label = QtWidgets.QLabel("enter")
+        self.th_enter = QtWidgets.QLineEdit()
+        self.th_enter.setFixedWidth(90)
+        grid.addWidget(enter_label, 2, 0)
+        grid.addWidget(self.th_enter, 2, 1)
 
         self.reset_th_btn = QtWidgets.QPushButton("阈值恢复默认")
         self.reset_th_btn.clicked.connect(self.reset_thresholds)
@@ -201,9 +211,10 @@ class AppWindow(QtWidgets.QMainWindow):
         gb_log = QtWidgets.QGroupBox("日志")
         left.addWidget(gb_log, 1)
         v_log = QtWidgets.QVBoxLayout(gb_log)
-        self.log_text = QtWidgets.QTextEdit()
+        self.log_text = QtWidgets.QPlainTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setFont(QtGui.QFont("Consolas", 10))
+        self.log_text.setMaximumBlockCount(5000)
         v_log.addWidget(self.log_text)
 
         # 右侧提示
@@ -275,7 +286,7 @@ class AppWindow(QtWidgets.QMainWindow):
         tip = (
             "1) 先确保电脑能直接运行 adb（或填入 adb.exe 路径）\n"
             "2) MuMu 端口以模拟器设置为准；常见：127.0.0.1:16384\n"
-            "3) 实时触发与任务触发可同时运行（互不阻塞）\n"
+            "3) 任务触发运行时会独占流程，实时触发会暂停点击\n"
             "4) 如误触发，调高阈值；如识别不到，调低阈值\n"
         )
         tip_label = QtWidgets.QLabel(tip)
@@ -368,15 +379,53 @@ class AppWindow(QtWidgets.QMainWindow):
     def _get_thresholds(self) -> Thresholds:
         return Thresholds(
             values={
-                # 默认：模板识别为主，阈值统一按 0.90；menu 例外（需要单独测试后再调）
-                "menu": self._parse_threshold(self.th_menu.text(), 0.80),
+                # menu/read 强制 OCR，阈值固定，避免运行中误调影响状态机。
+                "menu": 0.80,
                 "skip1": self._parse_threshold(self.th_skip1.text(), 0.90),
                 "skip2": self._parse_threshold(self.th_skip2.text(), 0.90),
-                "read": self._parse_threshold(self.th_read.text(), 0.90),
+                "read": 0.90,
                 "no_voice": self._parse_threshold(self.th_no_voice.text(), 0.90),
                 "lock": self._parse_threshold(self.th_lock.text(), 0.90),
+                "enter": self._parse_threshold(self.th_enter.text(), 0.80),
             }
         )
+
+    def _init_log_file(self) -> None:
+        try:
+            log_dir = self._base_dir / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            self._log_path = log_dir / f"bbassistant_{datetime.now():%Y%m%d_%H%M%S}.log"
+            self._log_fp = self._log_path.open("a", encoding="utf-8", buffering=1)
+        except Exception:
+            self._log_path = None
+            self._log_fp = None
+
+    @staticmethod
+    def _format_log_line(msg: str) -> str:
+        prefix = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        text = str(msg).replace("\r\n", "\n").replace("\r", "\n")
+        return "\n".join(f"{prefix} {line}" for line in text.split("\n"))
+
+    def _write_log_file(self, line: str) -> None:
+        fp = self._log_fp
+        if fp is None:
+            return
+        try:
+            fp.write(line + "\n")
+            fp.flush()
+        except Exception:
+            pass
+
+    def _close_log_file(self) -> None:
+        fp = self._log_fp
+        self._log_fp = None
+        if fp is None:
+            return
+        try:
+            fp.flush()
+            fp.close()
+        except Exception:
+            pass
 
     def log(self, msg: str) -> None:
         try:
@@ -385,18 +434,29 @@ class AppWindow(QtWidgets.QMainWindow):
             pass
 
     def _drain_logs(self) -> None:
-        changed = False
+        lines: list[str] = []
         while True:
             try:
                 msg = self.log_queue.get_nowait()
             except queue.Empty:
                 break
-            self.log_text.append(msg)
-            changed = True
-        if changed:
-            c = self.log_text.textCursor()
-            c.movePosition(QtGui.QTextCursor.MoveOperation.End)
-            self.log_text.setTextCursor(c)
+            line = self._format_log_line(str(msg))
+            lines.append(line)
+            self._write_log_file(line)
+
+        if not lines:
+            return
+
+        scroll_bar = self.log_text.verticalScrollBar()
+        old_value = scroll_bar.value()
+        was_at_bottom = old_value >= max(0, scroll_bar.maximum() - 2)
+
+        self.log_text.appendPlainText("\n".join(lines))
+
+        if was_at_bottom:
+            scroll_bar.setValue(scroll_bar.maximum())
+        else:
+            scroll_bar.setValue(min(old_value, scroll_bar.maximum()))
 
     def apply_adb_path(self) -> None:
         path = self.adb_path_edit.text().strip() or "adb"
@@ -436,12 +496,11 @@ class AppWindow(QtWidgets.QMainWindow):
             self.log(f"刷新设备失败：{e}")
 
     def reset_thresholds(self) -> None:
-        self.th_menu.setText("0.80")
         self.th_skip1.setText("0.90")
         self.th_skip2.setText("0.90")
-        self.th_read.setText("0.90")
         self.th_no_voice.setText("0.90")
         self.th_lock.setText("0.90")
+        self.th_enter.setText("0.80")
         self.log("阈值已恢复默认")
 
     @QtCore.Slot()
@@ -631,6 +690,11 @@ class AppWindow(QtWidgets.QMainWindow):
                 except Exception:
                     pass
         finally:
+            try:
+                self._drain_logs()
+            except Exception:
+                pass
+            self._close_log_file()
             super().closeEvent(event)
 
 

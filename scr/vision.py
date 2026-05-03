@@ -97,7 +97,9 @@ class TemplateMatcher:
         }
 
         # (name, w, h) -> (tpl_gray, tpl_edge, tpl_edge_soft)
-        self._scaled_cache: Dict[Tuple[str, int, int], Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        self._scaled_cache: Dict[
+            Tuple[str, int, int], Tuple[np.ndarray, np.ndarray, np.ndarray]
+        ] = {}
 
         # ROI 规则：既支持相对(0~1)也支持绝对像素(>=1)。
         # 你提供的 ROI（1920*1080，像素坐标）：
@@ -136,7 +138,12 @@ class TemplateMatcher:
         debug_dir = (os.environ.get("BB_DEBUG_DIR") or "").strip()
         base_debug_dir = Path(debug_dir) if debug_dir else (Path.cwd() / "debug")
         self._debug_lock_dir = base_debug_dir / "lock"
-        env_on = (os.environ.get("BB_DEBUG_LOCK") or "").strip().lower() in {"1", "true", "yes", "on"}
+        env_on = (os.environ.get("BB_DEBUG_LOCK") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         file_on = (self._debug_lock_dir / "enable").exists()
         self._debug_lock = bool(env_on or file_on)
 
@@ -152,14 +159,27 @@ class TemplateMatcher:
         # - BB_DEBUG_VISION_MIN_INTERVAL=1.0 同一 name 最小落盘间隔（秒）
         self._debug_base_dir = base_debug_dir
         self._debug_compat_vision_dir = base_debug_dir / "vision"
-        env_on_v = (os.environ.get("BB_DEBUG_VISION") or "").strip().lower() in {"1", "true", "yes", "on"}
+        env_on_v = (os.environ.get("BB_DEBUG_VISION") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         file_on_v = (self._debug_compat_vision_dir / "enable").exists()
         self._debug_vision = bool(env_on_v or file_on_v)
         names_raw = (os.environ.get("BB_DEBUG_VISION_NAMES") or "").strip()
-        self._debug_vision_names = {n.strip() for n in names_raw.split(",") if n.strip()} if names_raw else set()
-        self._debug_vision_full = (os.environ.get("BB_DEBUG_VISION_FULL") or "").strip().lower() in {"1", "true", "yes", "on"}
+        self._debug_vision_names = (
+            {n.strip() for n in names_raw.split(",") if n.strip()}
+            if names_raw
+            else set()
+        )
+        self._debug_vision_full = (
+            os.environ.get("BB_DEBUG_VISION_FULL") or ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
         try:
-            self._debug_vision_min_interval = float(os.environ.get("BB_DEBUG_VISION_MIN_INTERVAL") or 1.0)
+            self._debug_vision_min_interval = float(
+                os.environ.get("BB_DEBUG_VISION_MIN_INTERVAL") or 1.0
+            )
         except Exception:
             self._debug_vision_min_interval = 1.0
         self._debug_vision_last_dump: Dict[str, float] = {}
@@ -209,18 +229,22 @@ class TemplateMatcher:
         *,
         reason: str = "",
         mode: str = "template",
-    ) -> None:
+        force: bool = False,
+    ) -> bool:
         """当开启 BB_DEBUG_VISION 时，将识别过程图落盘。
 
         设计目标：用于排查 wait_img 失败(best=N/A) 的原因（ROI 错、模板未加载、尺寸不匹配等）。
         """
 
-        if not self._debug_vision_enabled_for(name):
-            return
+        if not force and not self._debug_vision_enabled_for(name):
+            return False
         now = time.time()
         last = float(self._debug_vision_last_dump.get(str(name), 0.0))
-        if self._debug_vision_min_interval > 0 and (now - last) < self._debug_vision_min_interval:
-            return
+        if (
+            self._debug_vision_min_interval > 0
+            and (now - last) < self._debug_vision_min_interval
+        ):
+            return False
         self._debug_vision_last_dump[str(name)] = now
 
         sh, sw = screen_bgr.shape[:2]
@@ -238,15 +262,17 @@ class TemplateMatcher:
             f"mode={mode}",
             f"reason={reason}",
             f"screen={sw}x{sh}",
-            f"roi=({x0},{y0})-({x1},{y1}) size={max(0, x1-x0)}x{max(0, y1-y0)}",
+            f"roi=({x0},{y0})-({x1},{y1}) size={max(0, x1 - x0)}x{max(0, y1 - y0)}",
         ]
 
         if self._debug_vision_full:
             self._imwrite(out_dir / "screen_bgr.png", screen_bgr)
 
         if roi.size == 0:
-            (out_dir / "meta.txt").write_text("\n".join(meta_lines + ["roi_empty=1"]), encoding="utf-8")
-            return
+            (out_dir / "meta.txt").write_text(
+                "\n".join(meta_lines + ["roi_empty=1"]), encoding="utf-8"
+            )
+            return True
 
         # ROI 与预处理
         roi_gray_raw = _to_gray(roi)
@@ -261,8 +287,10 @@ class TemplateMatcher:
 
         # 模板与匹配（仅用于调试观察；不改变主逻辑）
         if name not in self._templates_gray:
-            (out_dir / "meta.txt").write_text("\n".join(meta_lines + ["template_loaded=0"]), encoding="utf-8")
-            return
+            (out_dir / "meta.txt").write_text(
+                "\n".join(meta_lines + ["template_loaded=0"]), encoding="utf-8"
+            )
+            return True
 
         base_w, base_h = self._sizes[name]
         scales = self._multi_scales.get(name, (1.0,))
@@ -319,7 +347,9 @@ class TemplateMatcher:
                 best_tpl = (tpl_gray, tpl_edge, tpl_edge_soft)
 
             # 3) 边缘（软）
-            res_e2 = cv2.matchTemplate(roi_edge_soft, tpl_edge_soft, cv2.TM_CCORR_NORMED)
+            res_e2 = cv2.matchTemplate(
+                roi_edge_soft, tpl_edge_soft, cv2.TM_CCORR_NORMED
+            )
             _, max_val_e2, _, max_loc_e2 = cv2.minMaxLoc(res_e2)
             if float(max_val_e2) > best_edge_soft:
                 best_edge_soft = float(max_val_e2)
@@ -335,9 +365,16 @@ class TemplateMatcher:
         meta_lines.append(f"best_edge={best_edge:.4f}")
         meta_lines.append(f"best_edge_soft={best_edge_soft:.4f}")
 
-        if best_score is None or best_loc is None or best_size is None or best_tpl is None:
-            (out_dir / "meta.txt").write_text("\n".join(meta_lines + ["matchable=0"]), encoding="utf-8")
-            return
+        if (
+            best_score is None
+            or best_loc is None
+            or best_size is None
+            or best_tpl is None
+        ):
+            (out_dir / "meta.txt").write_text(
+                "\n".join(meta_lines + ["matchable=0"]), encoding="utf-8"
+            )
+            return True
 
         meta_lines.append(f"best_method={best_method}")
         meta_lines.append(f"best_score={float(best_score):.4f}")
@@ -357,7 +394,13 @@ class TemplateMatcher:
         # 在 ROI 上画出 best 匹配框（更像 lock 的“过程可视化”）
         roi_box = roi.copy()
         try:
-            cv2.rectangle(roi_box, (int(bx), int(by)), (int(bx + bw), int(by + bh)), (0, 255, 0), 2)
+            cv2.rectangle(
+                roi_box,
+                (int(bx), int(by)),
+                (int(bx + bw), int(by + bh)),
+                (0, 255, 0),
+                2,
+            )
         except Exception:
             pass
         self._imwrite(out_dir / "roi_bgr_box.png", roi_box)
@@ -398,6 +441,8 @@ class TemplateMatcher:
             r8 = np.clip(r * 255.0, 0, 255).astype(np.uint8)
             heat = cv2.applyColorMap(r8, cv2.COLORMAP_JET)
             self._imwrite(out_dir / "response_heat.png", heat)
+
+        return True
 
     @staticmethod
     def _imwrite(path: Path, img: np.ndarray) -> None:
@@ -518,7 +563,11 @@ class TemplateMatcher:
         # - "images/enter.png"：相对于 assets 目录（img_dir 的父目录）
         if rel.is_absolute():
             path = rel
-        elif len(rel.parts) >= 2 and rel.parts[0] == "assets" and rel.parts[1] == "images":
+        elif (
+            len(rel.parts) >= 2
+            and rel.parts[0] == "assets"
+            and rel.parts[1] == "images"
+        ):
             path = self.img_dir.parent.parent / rel
         elif rel.parts and rel.parts[0] == self.img_dir.name:
             path = self.img_dir.parent / rel
@@ -561,17 +610,21 @@ class TemplateMatcher:
         accel = (os.environ.get("BB_OCR_ACCEL") or "dml").strip().lower()
         kwargs = {}
         if accel == "cuda":
-            kwargs.update({
-                "det_use_cuda": True,
-                "cls_use_cuda": True,
-                "rec_use_cuda": True,
-            })
+            kwargs.update(
+                {
+                    "det_use_cuda": True,
+                    "cls_use_cuda": True,
+                    "rec_use_cuda": True,
+                }
+            )
         elif accel == "dml":
-            kwargs.update({
-                "det_use_dml": True,
-                "cls_use_dml": True,
-                "rec_use_dml": True,
-            })
+            kwargs.update(
+                {
+                    "det_use_dml": True,
+                    "cls_use_dml": True,
+                    "rec_use_dml": True,
+                }
+            )
 
         # 如果用户配置了加速但环境不满足，RapidOCR 可能会抛异常；这里自动回退到 CPU。
         try:
@@ -656,7 +709,9 @@ class TemplateMatcher:
             scale = 2.0
         else:
             scale = 1.5
-        up = cv2.resize(roi_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        up = cv2.resize(
+            roi_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
+        )
 
         variants: list[np.ndarray] = [up]
 
@@ -711,7 +766,9 @@ class TemplateMatcher:
         if roi.size == 0:
             return None
 
-        variants, scale = self._ocr_build_variants(roi, aggressive=(name in {"skip1", "skip2"}))
+        variants, scale = self._ocr_build_variants(
+            roi, aggressive=(name in {"skip1", "skip2"})
+        )
         if not scale or scale <= 0:
             scale = 1.0
 
@@ -773,7 +830,12 @@ class TemplateMatcher:
         x0r, y0r, x1r, y1r = rule
 
         # 如果四个值都在 0~1，按相对比例解释；否则按绝对像素解释。
-        if 0.0 <= float(x0r) <= 1.0 and 0.0 <= float(y0r) <= 1.0 and 0.0 <= float(x1r) <= 1.0 and 0.0 <= float(y1r) <= 1.0:
+        if (
+            0.0 <= float(x0r) <= 1.0
+            and 0.0 <= float(y0r) <= 1.0
+            and 0.0 <= float(x1r) <= 1.0
+            and 0.0 <= float(y1r) <= 1.0
+        ):
             x0 = int(max(0, min(sw, round(sw * float(x0r)))))
             y0 = int(max(0, min(sh, round(sh * float(y0r)))))
             x1 = int(max(0, min(sw, round(sw * float(x1r)))))
@@ -795,7 +857,9 @@ class TemplateMatcher:
             y0, y1 = 0, sh
         return (x0, y0, x1, y1)
 
-    def _get_scaled_tpl(self, name: str, w: int, h: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _get_scaled_tpl(
+        self, name: str, w: int, h: int
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         key = (name, int(w), int(h))
         hit = self._scaled_cache.get(key)
         if hit is not None:
@@ -846,7 +910,9 @@ class TemplateMatcher:
 
         return self._find_by_ocr(screen_bgr, name)
 
-    def find_best(self, screen_bgr: np.ndarray, name: str, *, allow_ocr: bool = True) -> Optional[Match]:
+    def find_best(
+        self, screen_bgr: np.ndarray, name: str, *, allow_ocr: bool = True
+    ) -> Optional[Match]:
         # lock：明确使用图像识别（模板匹配），并优先考虑灰度图。
         # 这里采用“多种匹配方法 + 形状校验（圆形）”，解决 lock 置信度偏低的问题。
         # 同时支持落盘调试：
@@ -923,7 +989,10 @@ class TemplateMatcher:
                     screen_edge_u = screen_edge
                     tpl_edge_u = tpl_edge
 
-                if tpl_edge_u.shape[0] > screen_edge_u.shape[0] or tpl_edge_u.shape[1] > screen_edge_u.shape[1]:
+                if (
+                    tpl_edge_u.shape[0] > screen_edge_u.shape[0]
+                    or tpl_edge_u.shape[1] > screen_edge_u.shape[1]
+                ):
                     continue
 
                 res = cv2.matchTemplate(screen_edge_u, tpl_edge_u, cv2.TM_CCORR_NORMED)
@@ -1014,7 +1083,17 @@ class TemplateMatcher:
                 circle_ok = False
 
             # 置信度融合：位置由 edge 决定；信心由 edge + 灰度评估共同决定。
-            final_score = float(max(0.0, min(1.0, 0.70 * float(edge_score) + 0.15 * float(gray_ccorr_score) + 0.15 * float(gray_sqdiff_score))))
+            final_score = float(
+                max(
+                    0.0,
+                    min(
+                        1.0,
+                        0.70 * float(edge_score)
+                        + 0.15 * float(gray_ccorr_score)
+                        + 0.15 * float(gray_sqdiff_score),
+                    ),
+                )
+            )
             if not circle_ok:
                 final_score = float(max(0.0, min(1.0, final_score * 0.85)))
 
@@ -1067,7 +1146,9 @@ class TemplateMatcher:
         roi = screen_bgr[y0:y1, x0:x1]
 
         if roi.size == 0:
-            self.debug_dump_if_enabled(screen_bgr, name, reason="empty_roi", mode="template")
+            self.debug_dump_if_enabled(
+                screen_bgr, name, reason="empty_roi", mode="template"
+            )
             return None
 
         roi_gray_raw = _to_gray(roi)
@@ -1113,7 +1194,9 @@ class TemplateMatcher:
                 best_size = (w, h)
 
             # 3) 边缘（软）
-            res_edge2 = cv2.matchTemplate(screen_edge_soft, tpl_edge_soft, cv2.TM_CCORR_NORMED)
+            res_edge2 = cv2.matchTemplate(
+                screen_edge_soft, tpl_edge_soft, cv2.TM_CCORR_NORMED
+            )
             _, max_val_e2, _, max_loc_e2 = cv2.minMaxLoc(res_edge2)
             if best_score is None or float(max_val_e2) > best_score:
                 best_score = float(max_val_e2)
@@ -1122,7 +1205,9 @@ class TemplateMatcher:
 
         # 若 ROI/模板尺寸导致无法匹配（没有任何 scale 可用），返回 None
         if best_score is None or best_loc is None or best_size is None:
-            self.debug_dump_if_enabled(screen_bgr, name, reason="no_scale_match", mode="template")
+            self.debug_dump_if_enabled(
+                screen_bgr, name, reason="no_scale_match", mode="template"
+            )
             return None
 
         # 坐标从 ROI 转回全屏
@@ -1162,7 +1247,9 @@ def decode_screencap_raw(raw_bytes: bytes) -> np.ndarray:
     # Most common is RGBA_8888 (fmt==1), but we primarily validate by payload size.
     expected = 12 + int(w) * int(h) * 4
     if len(raw_bytes) < expected:
-        raise ValueError(f"raw screencap length mismatch: got={len(raw_bytes)} expected>={expected} fmt={fmt}")
+        raise ValueError(
+            f"raw screencap length mismatch: got={len(raw_bytes)} expected>={expected} fmt={fmt}"
+        )
 
     buf = memoryview(raw_bytes)[12:expected]
     rgba = np.frombuffer(buf, dtype=np.uint8).reshape((int(h), int(w), 4))
